@@ -1,0 +1,112 @@
+name: Sync Release to Cloudflare R2
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to sync (e.g. v0.1.0)'
+        required: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${{ github.event.release.tag_name }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p assets
+          gh release download "${{ steps.tag.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --dir assets
+          echo "Downloaded files:"
+          ls -lh assets/
+
+      - name: Install wrangler
+        run: npm install -g wrangler
+
+      - name: Upload assets to R2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          VERSION="${{ steps.tag.outputs.tag }}"
+          VERSION_CLEAN="${VERSION#v}"  # Remove 'v' prefix
+
+          for file in assets/*; do
+            filename=$(basename "$file")
+            echo "Uploading $filename -> releases/${VERSION_CLEAN}/${filename}"
+            wrangler r2 object put "catclaw-assets/releases/${VERSION_CLEAN}/${filename}" \
+              --file "$file" \
+              --content-type "application/octet-stream"
+          done
+
+      - name: Generate and upload latest.json
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          VERSION="${{ steps.tag.outputs.tag }}"
+          VERSION_CLEAN="${VERSION#v}"
+          BASE_URL="https://catclaw-website.lu18550402946.workers.dev/dl"
+
+          # Build assets array
+          ASSETS_JSON="["
+          FIRST=true
+          for file in assets/*; do
+            filename=$(basename "$file")
+            size=$(stat --format=%s "$file")
+
+            # Determine platform
+            if [[ "$filename" == *"arm64.dmg" ]]; then
+              platform="macos-arm64"
+              label="macOS (Apple Silicon)"
+            elif [[ "$filename" == *"x64.dmg" ]]; then
+              platform="macos-x64"
+              label="macOS (Intel)"
+            elif [[ "$filename" == *".exe" ]]; then
+              platform="windows-x64"
+              label="Windows (64-bit)"
+            else
+              platform="other"
+              label="$filename"
+            fi
+
+            if [ "$FIRST" = true ]; then
+              FIRST=false
+            else
+              ASSETS_JSON+=","
+            fi
+            ASSETS_JSON+="{\"filename\":\"${filename}\",\"platform\":\"${platform}\",\"label\":\"${label}\",\"size\":${size},\"url\":\"${BASE_URL}/${VERSION_CLEAN}/${filename}\"}"
+          done
+          ASSETS_JSON+="]"
+
+          cat > /tmp/latest.json << EOF
+          {
+            "version": "${VERSION_CLEAN}",
+            "tag": "${VERSION}",
+            "published_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "github_url": "https://github.com/${{ github.repository }}/releases/tag/${VERSION}",
+            "assets": ${ASSETS_JSON}
+          }
+          EOF
+
+          # Pretty print for verification
+          cat /tmp/latest.json | python3 -m json.tool
+
+          wrangler r2 object put "catclaw-assets/releases/latest.json" \
+            --file /tmp/latest.json \
+            --content-type "application/json"
+
+          echo "latest.json uploaded successfully"
